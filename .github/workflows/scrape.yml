@@ -6,7 +6,6 @@ on:
     - cron: '0 0 * * 4'
   
   workflow_dispatch:
-    # Allow manual trigger
     inputs:
       max_products:
         description: 'Max products to scrape (leave empty for all)'
@@ -16,14 +15,12 @@ on:
         description: 'Run in test mode (5 products)'
         required: false
         type: boolean
+        default: false
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    outputs:
-      scraped: ${{ steps.run_scraper.outputs.scraped }}
-      embedded: ${{ steps.run_scraper.outputs.embedded }}
-      imported: ${{ steps.run_scraper.outputs.imported }}
+    timeout-minutes: 30
     
     steps:
       - name: Checkout code
@@ -49,10 +46,13 @@ jobs:
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN || '' }}
         run: |
-          if [ "${{ github.event.inputs.test_mode }}" == "true" ]; then
+          echo "Test mode: ${{ github.event.inputs.test_mode }}"
+          echo "Max products: ${{ github.event.inputs.max_products }}"
+          
+          if [[ "${{ github.event.inputs.test_mode }}" == "true" ]]; then
             echo "Running in test mode..."
             python main.py --test 2>&1 | tee scraper.log
-          elif [ -n "${{ github.event.inputs.max_products }}" ]; then
+          elif [[ -n "${{ github.event.inputs.max_products }}" ]]; then
             echo "Running with max products: ${{ github.event.inputs.max_products }}"
             python main.py --max-products ${{ github.event.inputs.max_products }} 2>&1 | tee scraper.log
           else
@@ -60,10 +60,9 @@ jobs:
             python main.py 2>&1 | tee scraper.log
           fi
           
-          # Parse results from log
-          echo "scraped=$(grep 'Products scraped:' scraper.log | awk '{print $3}')" >> $GITHUB_OUTPUT
-          echo "embedded=$(grep 'Products embedded:' scraper.log | awk '{print $3}')" >> $GITHUB_OUTPUT
-          echo "imported=$(grep 'Products imported:' scraper.log | awk '{print $3}')" >> $GITHUB_OUTPUT
+          echo "scraped=$(grep 'Products scraped:' scraper.log | awk '{print $3}' || echo 0)" >> $GITHUB_OUTPUT
+          echo "embedded=$(grep 'Products embedded:' scraper.log | awk '{print $3}' || echo 0)" >> $GITHUB_OUTPUT
+          echo "imported=$(grep 'Products imported:' scraper.log | awk '{print $3}' || echo 0)" >> $GITHUB_OUTPUT
       
       - name: Upload scraper logs
         if: always()
@@ -81,9 +80,8 @@ jobs:
     steps:
       - name: Show result
         run: |
-          if [ "${{ needs.scrape.result }}" == "success" ]; then
+          if [[ "${{ needs.scrape.result }}" == "success" ]]; then
             echo "✅ Clout Collection Scraper completed successfully!"
-            echo "Check Supabase for imported products."
           else
             echo "❌ Scraper failed. Check logs for details."
             exit 1

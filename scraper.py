@@ -32,6 +32,7 @@ class CloutCollectionScraper:
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
+        self.max_retries = 3
         
         # Track found products
         self.product_handles: list[str] = []
@@ -62,14 +63,24 @@ class CloutCollectionScraper:
         """Scrape all products from the collections page"""
         print(f"Starting scraper for {self.base_url}")
         
-        # Navigate to collections page
+        # Navigate to collections page with retries
         collections_url = f"{self.base_url}/collections/view-all"
         print(f"Navigating to {collections_url}")
         
-        await self.page.goto(collections_url, wait_until='networkidle')
-        
-        # Wait for initial products to load
-        await self.page.wait_for_selector('.grid-view-item, .product-index, [data-product-handle]', timeout=30000)
+        for attempt in range(self.max_retries):
+            try:
+                await self.page.goto(collections_url, wait_until='domcontentloaded', timeout=90000)
+                
+                # Wait for initial products to load
+                await self.page.wait_for_selector('.grid-view-item, .product-index, [data-product-handle]', timeout=30000)
+                break
+            except Exception as e:
+                print(f"Attempt {attempt + 1} failed: {e}")
+                if attempt < self.max_retries - 1:
+                    print("Retrying...")
+                    await self.page.reload(wait_until='domcontentloaded')
+                else:
+                    raise
         
         # Click "Load More" button until no more products load
         await self._click_load_more()
@@ -198,20 +209,25 @@ class CloutCollectionScraper:
     
     async def scrape_product_details(self, product_url: str) -> Optional[dict]:
         """Scrape detailed information from a single product page"""
-        try:
-            await self.page.goto(product_url, wait_until='networkidle')
-            
-            # Wait for product info to load
-            await self.page.wait_for_selector('[data-product-id], [data-product-handle]', timeout=30000)
-            
-            # Extract product data from page
-            product_data = await self._extract_product_data()
-            
-            return product_data
-            
-        except Exception as e:
-            print(f"Error scraping {product_url}: {e}")
-            return None
+        for attempt in range(self.max_retries):
+            try:
+                await self.page.goto(product_url, wait_until='domcontentloaded', timeout=90000)
+                
+                # Wait for product info to load
+                await self.page.wait_for_selector('[data-product-id], [data-product-handle]', timeout=30000)
+                
+                # Extract product data from page
+                product_data = await self._extract_product_data()
+                
+                return product_data
+                
+            except Exception as e:
+                print(f"Attempt {attempt + 1} failed for {product_url}: {e}")
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(2)
+                else:
+                    print(f"Error scraping {product_url}: {e}")
+                    return None
     
     async def _extract_product_data(self) -> dict:
         """Extract all product data from current page"""
