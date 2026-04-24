@@ -105,7 +105,7 @@ class CloutCollectionPipeline:
         
         async with CloutCollectionScraper(BASE_URL, HEADLESS) as scraper:
             # Navigate to collections page and click Load More until done
-            await scraper.page.goto(COLLECTIONS_URL, wait_until='networkidle')
+            await scraper.page.goto(COLLECTIONS_URL, wait_until='domcontentloaded', timeout=90000)
             await scraper.page.wait_for_selector(
                 '.grid-view-item, .product-index, [data-product-handle]',
                 timeout=30000
@@ -138,7 +138,8 @@ class CloutCollectionPipeline:
                     # Get the product page HTML
                     await scraper.page.goto(
                         product_info['product_url'],
-                        wait_until='networkidle'
+                        wait_until='domcontentloaded',
+                        timeout=90000
                     )
                     
                     await scraper.page.wait_for_selector(
