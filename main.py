@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -39,6 +40,9 @@ class CloutCollectionPipeline:
         self.max_products = max_products
         self.test_mode = test_mode
         self.dry_run = dry_run
+        
+        # Track seen URLs for stale detection
+        self.seen_urls = self._load_seen_urls()
         
         # Initialize components
         self.db = create_supabase_client(SUPABASE_URL, SUPABASE_ANON_KEY)
@@ -355,32 +359,53 @@ class CloutCollectionPipeline:
         return data
     
     async def _generate_embeddings(self, products_data: list[dict]) -> list[dict]:
-        """Generate both image and text embeddings for products"""
+        """Generate embeddings only for changed products"""
+        # Load existing products first
+        existing_products = self._load_existing_products()
+        existing_by_url = {p['product_url']: p for p in existing_products}
+        
         for i, product in enumerate(products_data):
-            print(f"  [{i+1}/{len(products_data)}] {product['handle']}")
+            product_url = product['product_url']
+            self.seen_urls.add(product_url)  # Track for stale detection
             
-            try:
-                # Generate image embedding
-                if product.get('image_url'):
-                    image_emb = self.embedder.embed_image(product['image_url'])
-                    product['image_embedding'] = self.embedder.to_numpy(image_emb)
-                    self.products_embedded += 1
-                
-                # Generate info embedding (text)
-                # Combine: title + description + category + metadata
-                info_text = self._build_info_text(product)
-                if info_text:
-                    text_emb = self.embedder.embed_text(info_text)
-                    product['info_embedding'] = self.embedder.to_numpy(text_emb)
-                
-                print(f"    ✓ Embeddings generated")
-                
-            except Exception as e:
-                error_msg = f"Error embedding {product['handle']}: {str(e)}"
-                print(f"    ✗ Error: {error_msg}")
-                self.errors.append(error_msg)
+            existing = existing_by_url.get(product_url)
             
-            await asyncio.sleep(0.1)  # Rate limit embedding requests
+            # Check if we need new embeddings
+            needs_embedding = True
+            if existing:
+                # Has existing record - check if image changed
+                if existing.get('image_url') == product.get('image_url'):
+                    # Same image - copy existing embeddings
+                    product['image_embedding'] = existing.get('image_embedding')
+                    product['info_embedding'] = existing.get('info_embedding')
+                    needs_embedding = False
+                    print(f"  [{i+1}/{len(products_data)}] {product['handle']} - skipped (unchanged)")
+            
+            if needs_embedding:
+                print(f"  [{i+1}/{len(products_data)}] {product['handle']}")
+                
+                try:
+                    # Generate image embedding
+                    if product.get('image_url'):
+                        image_emb = self.embedder.embed_image(product['image_url'])
+                        product['image_embedding'] = self.embedder.to_numpy(image_emb)
+                        self.products_embedded += 1
+                    
+                    # Generate info embedding (text)
+                    info_text = self._build_info_text(product)
+                    if info_text:
+                        text_emb = self.embedder.embed_text(info_text)
+                        product['info_embedding'] = self.embedder.to_numpy(text_emb)
+                    
+                    print(f"    ✓ Embeddings generated")
+                    
+                except Exception as e:
+                    error_msg = f"Error embedding {product['handle']}: {str(e)}"
+                    print(f"    ✗ Error: {error_msg}")
+                    self.errors.append(error_msg)
+            
+            # Staggered embedding generation - 0.5s delay between API calls
+            await asyncio.sleep(0.5)
         
         return products_data
     
@@ -518,34 +543,268 @@ class CloutCollectionPipeline:
         return text[:500]
     
     async def _import_to_supabase(self, products: list[dict]) -> int:
-        """Import products to Supabase"""
-        # Skip import if dry run
+        """Import products to Supabase with smart batching and upsert logic"""
         if self.dry_run:
             print("  [DRY RUN] Skipping database import")
             return 0
         
-        imported = 0
+        # Get existing products for comparison
+        print("  Loading existing products from database...")
+        existing_products = self._load_existing_products()
+        existing_by_url = {p['product_url']: p for p in existing_products}
         
-        for i, product in enumerate(products):
-            print(f"  [{i+1}/{len(products)}] {product['handle']}")
+        new_count = 0
+        updated_count = 0
+        unchanged_count = 0
+        
+        # Separate into categories: new, needs_update, skip
+        products_to_insert = []
+        
+        for product in products:
+            product_url = product['product_url']
+            existing = existing_by_url.get(product_url)
             
-            try:
-                # Prepare record
-                record = self._prepare_record(product)
+            if existing is None:
+                # New product
+                new_count += 1
+                products_to_insert.append(product)
+            else:
+                # Check if anything changed
+                is_changed = self._is_product_changed(existing, product)
                 
-                # Insert to database
-                self.db.insert(TABLE_NAME, record)
-                
-                imported += 1
-                self.products_imported += 1
-                print(f"    ✓ Imported")
-                
-            except Exception as e:
-                error_msg = f"Error importing {product['handle']}: {str(e)}"
-                print(f"    ✗ Error: {error_msg}")
-                self.errors.append(error_msg)
+                if is_changed:
+                    # Product changed - needs update with new embeddings
+                    updated_count += 1
+                    products_to_insert.append(product)
+                else:
+                    # Unchanged - skip
+                    unchanged_count += 1
+                    # Still track that we saw it
+                    self.seen_urls.add(product_url)
         
-        return imported
+        # Batch insert updated/new products
+        print(f"  New: {new_count}, Updated: {updated_count}, Unchanged: {unchanged_count}")
+        
+        if products_to_insert:
+            await self._batch_insert(products_to_insert)
+        
+        self.products_imported = new_count + updated_count
+        
+        # Find and delete stale products
+        stale_count = await self._remove_stale_products()
+        
+        # Print summary
+        print()
+        print("=" * 60)
+        print("RUN SUMMARY")
+        print(f"  New products added: {new_count}")
+        print(f"  Products updated: {updated_count}")
+        print(f"  Products unchanged (skipped): {unchanged_count}")
+        print(f"  Stale products deleted: {stale_count}")
+        print("=" * 60)
+        
+        return self.products_imported
+    
+    def _load_existing_products(self) -> list[dict]:
+        """Load all existing products for this source"""
+        all_products = []
+        page = 0
+        page_size = 1000
+        
+        while True:
+            products = self.db.select(
+                TABLE_NAME,
+                filters={'source': SOURCE},
+                columns='id,product_url,title,description,category,price,image_url,additional_images,metadata,updated_at',
+                limit=page_size,
+                offset=page * page_size
+            )
+            if not products:
+                break
+            all_products.extend(products)
+            page += 1
+            if len(products) < page_size:
+                break
+        
+        return all_products
+    
+    def _is_product_changed(self, existing: dict, new_product: dict) -> bool:
+        """Check if product data has changed"""
+        # Check key fields that matter for upsert
+        if existing.get('title') != new_product.get('title'):
+            return True
+        if existing.get('description') != new_product.get('description'):
+            return True
+        if existing.get('category') != new_product.get('category'):
+            return True
+        if existing.get('price') != new_product.get('price'):
+            return True
+        if existing.get('image_url') != new_product.get('image_url'):
+            return True
+        if existing.get('sale') != new_product.get('sale'):
+            return True
+        
+        # Check additional images
+        existing_additional = existing.get('additional_images', '') or ''
+        new_additional = new_product.get('additional_images', [])
+        if isinstance(new_additional, list):
+            new_additional = ' , '.join(new_additional)
+        if existing_additional != new_additional:
+            return True
+        
+        return False
+    
+    def _should_regenerate_embeddings(self, existing: dict, product: dict) -> bool:
+        """Check if embeddings need to be regenerated"""
+        # Always regenerate if there are no embeddings
+        if not existing.get('image_embedding') and product.get('image_embedding'):
+            return True
+        if not existing.get('info_embedding') and product.get('info_embedding'):
+            return True
+        
+        # Regenerate if image URL changed
+        if existing.get('image_url') != product.get('image_url'):
+            return True
+        
+        return False
+    
+    async def _batch_insert(self, products: list[dict]) -> int:
+        """Insert products in batches with retry logic"""
+        batch_size = 50
+        total_inserted = 0
+        
+        for i in range(0, len(products), batch_size):
+            batch = products[i:i + batch_size]
+            batch_num = i // batch_size + 1
+            total_batches = (len(products) + batch_size - 1) // batch_size
+            
+            print(f"  Inserting batch {batch_num}/{total_batches} ({len(batch)} products)...")
+            
+            for retry in range(3):  # 3 retries
+                try:
+                    self._insert_batch(batch)
+                    total_inserted += len(batch)
+                    break
+                except Exception as e:
+                    if retry < 2:
+                        print(f"    Retry {retry + 1} after error: {e}")
+                        await asyncio.sleep(2)
+                    else:
+                        # Log failed batch to file
+                        self._log_failed_batch(batch, str(e))
+                        print(f"    ✗ Batch failed after 3 retries")
+        
+        return total_inserted
+    
+    def _insert_batch(self, products: list[dict]) -> None:
+        """Insert a batch of products"""
+        records = []
+        
+        for product in products:
+            record = self._prepare_record(product)
+            records.append(record)
+        
+        # Use bulk insert
+        for record in records:
+            self.db.insert(TABLE_NAME, record)
+        
+        # Add small delay between API calls
+        time.sleep(0.1)
+    
+    def _log_failed_batch(self, products: list[dict], error: str) -> None:
+        """Log failed batch to file"""
+        import os
+        from datetime import datetime
+        
+        log_dir = os.path.dirname(os.path.abspath(__file__))
+        log_file = os.path.join(log_dir, 'failed_imports.log')
+        
+        timestamp = datetime.now().isoformat()
+        
+        with open(log_file, 'a') as f:
+            f.write(f"\n--- {timestamp} ---\n")
+            f.write(f"Error: {error}\n")
+            f.write(f"Products: {len(products)}\n")
+            for p in products:
+                f.write(f"  - {p.get('handle')}: {p.get('product_url')}\n")
+    
+    async def _remove_stale_products(self) -> int:
+        """Remove products not seen in this run"""
+        # Get all products for this source
+        all_products = self.db.select(
+            TABLE_NAME,
+            filters={'source': SOURCE},
+            columns='id,product_url,updated_at',
+            limit=10000
+        )
+        
+        stale_count = 0
+        
+        for product in all_products:
+            product_url = product.get('product_url')
+            
+            # Check if this URL was seen in current run
+            if product_url not in self.seen_urls:
+                # Product wasn't seen - check when it was last updated
+                updated_at = product.get('updated_at')
+                
+                if updated_at:
+                    # Parse the timestamp
+                    from datetime import datetime
+                    try:
+                        last_update = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
+                        now = datetime.now(last_update.tzinfo)
+                        days_since_update = (now - last_update).days
+                        
+                        # Delete if not updated in over 2 weeks (stale)
+                        if days_since_update > 14:
+                            self.db.delete(TABLE_NAME, {'id': product.get('id')})
+                            stale_count += 1
+                    except Exception:
+                        pass
+        
+        # Track current run's product URLs for next time
+        self._save_seen_urls()
+        
+        return stale_count
+    
+    def _save_seen_urls(self) -> None:
+        """Save seen URLs to file for stale detection"""
+        import os
+        import json
+        
+        file_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            'seen_products.json'
+        )
+        
+        data = {
+            'urls': list(self.seen_urls),
+            'last_run': datetime.now().isoformat()
+        }
+        
+        with open(file_path, 'w') as f:
+            json.dump(data, f)
+    
+    def _load_seen_urls(self) -> set:
+        """Load previously seen URLs"""
+        import os
+        import json
+        
+        file_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            'seen_products.json'
+        )
+        
+        if not os.path.exists(file_path):
+            return set()
+        
+        try:
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+                return set(data.get('urls', []))
+        except Exception:
+            return set()
     
     def _prepare_record(self, product: dict) -> dict:
         """Prepare product record for database"""
