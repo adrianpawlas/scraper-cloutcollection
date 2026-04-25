@@ -208,6 +208,12 @@ class CloutCollectionPipeline:
             data['title'] = json_ld_data.get('name', '')
             data['description'] = json_ld_data.get('description', '')
             
+            # Get product type/category from JSON-LD
+            product_type = json_ld_data.get('productType') or json_ld_data.get('category', '')
+            if product_type and not data.get('category'):
+                categories = [c.strip() for c in re.split(r'[,/&]', str(product_type)) if c.strip()]
+                data['category'] = ', '.join(categories)
+            
             # Get price from offer
             offer = json_ld_data.get('offers', {})
             if offer:
@@ -420,11 +426,21 @@ class CloutCollectionPipeline:
         except json.JSONDecodeError:
             pass
         
-        # Manual parsing for JS objects
-        # Handle string keys and values
-        # Try extracting the JSON from script tag more carefully
-        # First try: find product data in JSON-LD which is always valid JSON
-        return {}
+        # Manual extraction using regex - extract key: 'value' or key: "value" pairs
+        patterns = {
+            'title': r"title:\s*['\"]([^'\"]+)['\"]",
+            'type': r"type:\s*['\"]([^'\"]+)['\"]",
+            'vendor': r"vendor:\s*['\"]([^'\"]+)['\"]",
+            'product': r"product:\s*['\"]?(\d+)['\"]?",
+            'description': r"description:\s*['\"]([^'\"]+)['\"]",
+        }
+        
+        for key, pattern in patterns.items():
+            match = re.search(pattern, js_str)
+            if match:
+                result[key] = match.group(1)
+        
+        return result
     
     def _extract_json_ld_product(self, html: str) -> dict:
         """Extract Product data from JSON-LD structured data in HTML"""
