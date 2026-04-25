@@ -169,7 +169,6 @@ class SupabaseClient:
                     converted[key] = None
                 elif isinstance(value, (list, tuple)):
                     # Convert to PostgreSQL vector string format
-                    # Format: [val1,val2,...]
                     converted[key] = '[' + ','.join(str(float(v)) for v in value) + ']'
                 elif hasattr(value, 'tolist'):
                     arr = value.tolist()
@@ -177,13 +176,15 @@ class SupabaseClient:
                 else:
                     converted[key] = str(value)
             elif isinstance(value, (list, tuple)):
-                # Handle lists - they might contain embeddings
-                converted[key] = [
-                    self._item_to_native(v) for v in value
-                ]
+                # Convert python list/tuple to PostgreSQL array format: {val1,val2,val3}
+                if all(isinstance(v, (str,)) for v in value):
+                    # String array
+                    converted[key] = '{' + ','.join([f'"{v}"' for v in value]) + '}'
+                else:
+                    converted[key] = '{' + ','.join(str(v) for v in value) + '}'
             elif hasattr(value, 'tolist'):
-                # numpy array
-                converted[key] = value.tolist()
+                # numpy array - convert to list first
+                converted[key] = '{' + ','.join(str(float(v)) for v in value.tolist()) + '}'
             elif hasattr(value, 'item'):
                 # numpy scalar
                 converted[key] = value.item()
