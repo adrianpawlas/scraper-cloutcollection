@@ -7,6 +7,7 @@ torch>=2.1.0
 transformers>=4.36.0
 Pillow>=10.1.0
 sentencepiece>=0.1.99
+protobuf>=3.20.0
 
 # Database
 # (no extra deps needed - using requests)
