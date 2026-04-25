@@ -730,43 +730,76 @@ class CloutCollectionPipeline:
     
     async def _remove_stale_products(self) -> int:
         """Remove products not seen in this run"""
-        # Get all products for this source
-        all_products = self.db.select(
-            TABLE_NAME,
-            filters={'source': SOURCE},
-            columns='id,product_url,updated_at',
-            limit=10000
-        )
+        # Track consecutive misses
+        seen_this_run = self.seen_urls
         
+        # Load last run's seen URLs
+        last_run_urls = self._load_seen_urls()
+        
+        # Products that were in last run but not in this run
+        was_in_last_run = set(last_run_urls)
+        stale_urls = was_in_last_run - seen_this_run
+        
+        # Count how many times we've seen these as stale
+        stale_file = self._get_stale_tracker()
         stale_count = 0
         
-        for product in all_products:
-            product_url = product.get('product_url')
+        for url in stale_urls:
+            stale_file[url] = stale_file.get(url, 0) + 1
             
-            # Check if this URL was seen in current run
-            if product_url not in self.seen_urls:
-                # Product wasn't seen - check when it was last updated
-                updated_at = product.get('updated_at')
-                
-                if updated_at:
-                    # Parse the timestamp
-                    from datetime import datetime
-                    try:
-                        last_update = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
-                        now = datetime.now(last_update.tzinfo)
-                        days_since_update = (now - last_update).days
-                        
-                        # Delete if not updated in over 2 weeks (stale)
-                        if days_since_update > 14:
-                            self.db.delete(TABLE_NAME, {'id': product.get('id')})
-                            stale_count += 1
-                    except Exception:
-                        pass
+            # Delete if missed 2+ times
+            if stale_file[url] >= 2:
+                # Find and delete product
+                all_products = self.db.select(
+                    TABLE_NAME,
+                    filters={'product_url': url, 'source': SOURCE},
+                    columns='id',
+                    limit=1
+                )
+                if all_products:
+                    self.db.delete(TABLE_NAME, {'id': all_products[0].get('id')})
+                    stale_count += 1
         
-        # Track current run's product URLs for next time
-        self._save_seen_urls()
+        # Save updated stale tracker
+        self._save_stale_tracker(stale_file)
         
         return stale_count
+    
+    def _get_stale_tracker(self) -> dict:
+        """Get stale tracking data"""
+        import os
+        import json
+        
+        file_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            'stale_tracker.json'
+        )
+        
+        if not os.path.exists(file_path):
+            return {}
+        
+        try:
+            with open(file_path, 'r') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    
+    def _save_stale_tracker(self, tracker: dict) -> None:
+        """Save stale tracking data"""
+        import os
+        import json
+        
+        file_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            'stale_tracker.json'
+        )
+        
+        # Also update seen URLs
+        self._save_seen_urls()
+        
+        # Save tracker
+        with open(file_path, 'w') as f:
+            json.dump(tracker, f)
     
     def _save_seen_urls(self) -> None:
         """Save seen URLs to file for stale detection"""

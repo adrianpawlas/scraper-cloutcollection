@@ -107,7 +107,8 @@ class SupabaseClient:
         table: str, 
         filters: Optional[dict] = None,
         columns: str = '*',
-        limit: Optional[int] = None
+        limit: Optional[int] = None,
+        offset: int = 0
     ) -> list[dict]:
         """Select records from table"""
         endpoint = f'{self.url}/rest/v1/{table}'
@@ -123,6 +124,9 @@ class SupabaseClient:
         
         if limit:
             params['limit'] = limit
+        
+        if offset:
+            params['offset'] = offset
         
         response = requests.get(
             endpoint,
